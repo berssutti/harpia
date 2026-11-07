@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+session/
+*.session
+test_worker.py

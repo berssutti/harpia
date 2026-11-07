@@ -1,0 +1,23 @@
+{
+  "name": "harpia-web",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "nuxt": "^4.4.2",
+    "vue": "^3.5.33",
+    "vue-router": "^5.0.6"
+  },
+  "devDependencies": {
+    "@vue/test-utils": "^2.4.6",
+    "jsdom": "^26.0.0",
+    "vitest": "^3.0.0"
+  }
+}

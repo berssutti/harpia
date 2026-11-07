@@ -1,0 +1,30 @@
+# Git
+.worktrees/
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# Python / Backend
+*.db
+__pycache__/
+
+# Node / Frontend (Nuxt)
+node_modules
+.output
+.data
+.nuxt
+.nitro
+.cache
+dist
+
+# Logs
+logs
+*.log
+
+# IDEs and Misc
+.DS_Store
+.fleet
+.idea
+*.session

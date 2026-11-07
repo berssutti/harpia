@@ -1,0 +1,10 @@
+ceo@empresa.com.br
+financeiro@empresa.com.br
+seguranca@empresa.com.br
+empresa.com.br
+portal.empresa.com.br
+123.456.789-01
+98765432100
+ceo@empresa.com.br
+dominio-invalido
+linha com espacos

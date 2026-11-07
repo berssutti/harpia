@@ -1,0 +1,367 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+:root {
+  /* Camadas Tonais / Superfícies */
+  --bg-color: #0A0A0A;
+  --surface-1: #121212;
+  --surface-2: #1C1C1C;
+  --border-color: #262626;
+  
+  /* Cores Principais */
+  --primary: #FFB800;
+  --primary-hover: #e6a600;
+  --on-primary: #000000;
+  
+  --text-main: #e5e2e1;
+  --text-muted: #9e8f78;
+  
+  /* Cores Semânticas (Acentos) */
+  --danger: #ef4444;
+  --warning: #FFB800;
+  --success: #22c55e;
+  --info: #abebff;
+
+  /* Tipografia */
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'Space Grotesk', monospace;
+
+  /* Escala tipográfica */
+  --fs-label: 14px;
+  --fs-body: 16px;
+  --fs-control: 17px;
+  --fs-h1: 32px;
+  --fs-h2: 24px;
+  --fs-h3: 20px;
+  --fs-h4: 17px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: 1.5;
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Tipografia */
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-display);
+  margin: 0 0 16px 0;
+  color: var(--text-main);
+}
+
+h1 { font-size: var(--fs-h1); font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
+h2 { font-size: var(--fs-h2); font-weight: 600; line-height: 1.3; }
+h3 { font-size: var(--fs-h3); font-weight: 600; line-height: 1.35; }
+h4 { font-size: var(--fs-h4); font-weight: 600; line-height: 1.4; }
+
+p { margin: 0 0 16px 0; line-height: 1.5; }
+
+.label-caps {
+  font-family: var(--font-sans);
+  font-size: var(--fs-label);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.data-mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-body);
+  font-weight: 500;
+  letter-spacing: 0.05em;
+}
+
+/* Common UI Elements */
+.page-title {
+  margin-bottom: 24px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.card {
+  background-color: var(--surface-1);
+  border: 1px solid var(--border-color);
+  padding: 24px;
+  margin-bottom: 24px;
+  border-radius: 0; /* Cantos retos */
+}
+
+/* Botões */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 16px;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--fs-control);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: all 0.2s;
+  border-radius: 0; /* Cantos retos */
+}
+
+.btn-primary {
+  background-color: var(--primary);
+  color: var(--on-primary);
+  border: 1px solid var(--primary);
+}
+
+.btn-primary:hover {
+  background-color: var(--primary-hover);
+  border-color: var(--primary-hover);
+  box-shadow: 0 0 8px rgba(255, 184, 0, 0.4);
+}
+
+.btn-secondary {
+  background-color: transparent;
+  color: var(--primary);
+  border: 1px solid var(--border-color);
+}
+
+.btn-secondary:hover {
+  border-color: var(--primary);
+  background-color: rgba(255, 184, 0, 0.05);
+}
+
+.btn-danger {
+  background-color: transparent;
+  color: var(--danger);
+  border: 1px solid var(--border-color);
+}
+
+.btn-danger:hover {
+  border-color: var(--danger);
+  background-color: rgba(239, 68, 68, 0.05);
+}
+
+/* Forms */
+.form-group {
+  margin-bottom: 20px;
+}
+
+.form-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: var(--fs-label);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.form-input {
+  width: 100%;
+  padding: 12px;
+  background-color: var(--bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 0;
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: var(--fs-control);
+  transition: all 0.2s;
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+
+select.form-input {
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239e8f78' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 1rem center;
+  background-size: 1em;
+}
+
+/* Empty States */
+.empty-state {
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-color);
+}
+
+.empty-state .icon {
+  font-size: 32px;
+  margin-bottom: 16px;
+  display: block;
+  opacity: 0.5;
+}
+
+.empty-state h3 {
+  color: var(--text-main);
+  margin-bottom: 8px;
+}
+
+/* Threat Chips */
+.tag {
+  display: inline-block;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+  font-weight: 600;
+  text-transform: uppercase;
+  border: 1px solid var(--border-color);
+  border-radius: 0;
+}
+
+.tag-email {
+  border-color: var(--info);
+  color: var(--info);
+  background-color: rgba(171, 235, 255, 0.1);
+}
+
+.tag-domain {
+  border-color: var(--primary);
+  color: var(--primary);
+  background-color: rgba(255, 184, 0, 0.1);
+}
+
+.tag-cpf {
+  border-color: var(--danger);
+  color: var(--danger);
+  background-color: rgba(239, 68, 68, 0.1);
+}
+
+/* Scrollbar styling for high-tech feel */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-color);
+  border-left: 1px solid var(--border-color);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Dashboard Layout & Responsive Columns */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 3fr 2fr;
+  gap: 32px;
+  align-items: stretch;
+}
+
+/* Mobile Tabs Switcher */
+.dashboard-tabs {
+  display: none;
+  gap: 8px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 12px;
+}
+
+.tab-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  padding: 8px 16px;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--fs-body);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.tab-btn:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+  background-color: rgba(255, 184, 0, 0.05);
+}
+
+.tab-btn.active {
+  background-color: var(--primary);
+  color: var(--on-primary);
+  border-color: var(--primary);
+  box-shadow: 0 0 10px rgba(255, 184, 0, 0.3);
+}
+
+/* Modal Dialog */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(6px);
+  transition: opacity 0.25s ease;
+}
+
+.modal-content {
+  background-color: var(--surface-1);
+  border: 1px solid var(--primary);
+  padding: 32px;
+  width: 90%;
+  max-width: 480px;
+  box-shadow: 0 0 30px rgba(255, 184, 0, 0.15);
+  position: relative;
+  animation: modalSlideIn 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes modalSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-20px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.modal-title {
+  color: var(--primary);
+  margin-bottom: 24px;
+  font-size: var(--fs-h4);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Responsive Overrides */
+@media (max-width: 768px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  
+  .dashboard-tabs {
+    display: flex;
+  }
+  
+  /* Hide columns depending on active tab on mobile */
+  .col-feed, .col-watchlist {
+    display: none;
+  }
+  
+  .col-feed.active-tab, .col-watchlist.active-tab {
+    display: block;
+  }
+}
