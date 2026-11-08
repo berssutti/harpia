@@ -15,8 +15,6 @@ O Harpia roda com três aplicações e um arquivo SQLite:
   consulta a configuração periodicamente e envia as ocorrências para a API.
 - `SQLite`: banco em `harpia-backend/db/harpia.db`, montado como volume.
 
-Não há Redis nem OpenSearch. A comunicação entre worker e backend é HTTP.
-
 ```text
 Telegram <-> harpia-worker --HTTP--> harpia-backend <--> SQLite
                                           ^
