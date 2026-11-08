@@ -8,6 +8,9 @@
 
 # Python / Backend
 *.db
+*.db-wal
+*.db-shm
+harpia-backend/db/
 __pycache__/
 
 # Node / Frontend (Nuxt)
@@ -28,3 +31,5 @@ logs
 .fleet
 .idea
 *.session
+*.session-journal
+harpia-worker/session/

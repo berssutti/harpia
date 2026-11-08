@@ -1,22 +1,36 @@
-from fastapi import FastAPI, Depends, HTTPException, Request, Query
+from fastapi import FastAPI, Depends, HTTPException, Request, Query, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text, or_
 from loguru import logger
-import models
-import schemas
-import database
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from threading import Lock
+from collections import deque
+from contextlib import asynccontextmanager
+from typing import Optional
 import asyncio
-import redis.asyncio as redis
 import json
 import os
 import re
 import secrets
-import httpx
-from sqlalchemy import text
+import time
+import uuid
 
-app = FastAPI(title="Harpia API")
-VERSION = "0.1.0"
+import models
+import schemas
+import database
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    logger.info("Starting Harpia Backend API")
+    yield
+
+
+app = FastAPI(title="Harpia API", lifespan=lifespan)
+VERSION = "0.2.0"
 
 # Shared secret required by every data/mutation endpoint. The web app and the
 # worker send it in the X-API-Key header. Without it the API fails closed.
@@ -30,6 +44,30 @@ CORS_ORIGINS = [
     for origin in os.getenv("HARPIA_CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+WORKER_STALE_AFTER_SECONDS = _positive_int_env("WORKER_STALE_AFTER_SECONDS", 90)
+TELEGRAM_COMMAND_TTL_SECONDS = _positive_int_env("TELEGRAM_COMMAND_TTL_SECONDS", 600)
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @app.middleware("http")
@@ -62,16 +100,14 @@ if CORS_ORIGINS:
         allow_headers=["X-API-Key", "Content-Type"],
     )
 
-# Use REDIS_URL from env if available (docker-compose sets this), otherwise fallback to localhost
-redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-redis_client = redis.from_url(redis_url)
-
 models.Base.metadata.create_all(bind=database.engine)
 
 VALID_TARGET_TYPES = {"email", "domain", "cpf"}
 
+
 def normalize_group_key(name: str) -> str:
     return name.strip().lower().lstrip("@")
+
 
 def is_valid_target(target_type: str, value: str) -> bool:
     if target_type not in VALID_TARGET_TYPES or not value or any(ch.isspace() for ch in value):
@@ -84,24 +120,82 @@ def is_valid_target(target_type: str, value: str) -> bool:
         return "." in value and "@" not in value
     return False
 
-async def check_redis():
-    try:
-        if await redis_client.ping():
-            return "UP"
-    except Exception as e:
-        logger.error(f"Redis health check failed: {e}")
-    return "DOWN"
 
-async def check_opensearch():
-    opensearch_url = os.getenv('OPENSEARCH_URL', 'http://localhost:9200')
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(opensearch_url)
-            if response.status_code == 200:
-                return "UP"
-    except Exception as e:
-        logger.error(f"OpenSearch health check failed: {e}")
-    return "DOWN"
+class EventBroker:
+    """In-process fan-out for SSE clients.
+
+    Uvicorn runs a single process in this Compose setup, so an in-memory broker
+    is enough. Alerts are always committed before they are published here.
+    """
+
+    def __init__(self):
+        self._subscribers: set[asyncio.Queue] = set()
+
+    def subscribe(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self._subscribers.discard(queue)
+
+    def publish(self, payload: dict) -> None:
+        message = json.dumps(payload, ensure_ascii=False)
+        for queue in list(self._subscribers):
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                logger.warning("SSE client queue is full; dropping an event.")
+
+
+event_broker = EventBroker()
+
+
+@dataclass
+class WorkerCommand:
+    type: str
+    payload: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=time.monotonic)
+
+
+class CommandQueue:
+    """Transient UI -> worker commands.
+
+    Authentication codes and 2FA passwords are intentionally kept in memory
+    only. They expire and are never written to SQLite or application logs.
+    """
+
+    def __init__(self, ttl_seconds: int, max_items: int = 20):
+        self._ttl_seconds = ttl_seconds
+        self._max_items = max_items
+        self._commands: deque[WorkerCommand] = deque()
+        self._lock = Lock()
+
+    def _prune(self) -> None:
+        cutoff = time.monotonic() - self._ttl_seconds
+        while self._commands and self._commands[0].created_at < cutoff:
+            self._commands.popleft()
+
+    def add(self, command_type: str, **payload) -> None:
+        with self._lock:
+            self._prune()
+            self._commands.append(WorkerCommand(type=command_type, payload=payload))
+            while len(self._commands) > self._max_items:
+                self._commands.popleft()
+
+    def consume_all(self) -> list[dict]:
+        with self._lock:
+            self._prune()
+            commands = [
+                {"type": command.type, **command.payload}
+                for command in self._commands
+            ]
+            self._commands.clear()
+            return commands
+
+
+worker_commands = CommandQueue(TELEGRAM_COMMAND_TTL_SECONDS)
+
 
 def check_database(db: Session):
     try:
@@ -109,107 +203,122 @@ def check_database(db: Session):
         return "UP"
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
-    return "DOWN"
+        return "DOWN"
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting Harpia Backend API")
+
+def get_worker_state(db: Session) -> Optional[models.WorkerState]:
+    return db.get(models.WorkerState, 1)
+
+
+def worker_heartbeat_age(state: Optional[models.WorkerState]) -> Optional[int]:
+    if not state or not state.last_heartbeat:
+        return None
+    last = _as_utc(state.last_heartbeat)
+    return max(0, int((utcnow() - last).total_seconds()))
+
+
+def worker_is_fresh(state: Optional[models.WorkerState]) -> bool:
+    age = worker_heartbeat_age(state)
+    return age is not None and age <= WORKER_STALE_AFTER_SECONDS
+
+
+def worker_connected(state: Optional[models.WorkerState]) -> bool:
+    return bool(
+        state
+        and worker_is_fresh(state)
+        and state.status == "connected"
+    )
+
+
+TELEGRAM_STATE_LABELS = {
+    "connected": ("online", "Conectado"),
+    "waiting_for_code": ("waiting_for_code", "Aguardando Código"),
+    "waiting_for_password": ("waiting_for_password", "Aguardando Senha 2FA"),
+    "restarting": ("restarting", "Aguardando Telegram"),
+    "error": ("error", "Erro de Autenticação"),
+    "starting": ("offline", "Worker iniciando"),
+}
+
+
+def telegram_status_payload(state: Optional[models.WorkerState]) -> dict:
+    if not worker_is_fresh(state):
+        return {"status": "offline", "detail": "Desconectado (sem heartbeat)"}
+    status, detail = TELEGRAM_STATE_LABELS.get(
+        state.status, ("offline", "Estado desconhecido")
+    )
+    return {"status": status, "detail": detail}
+
+
+def worker_status_payload(state: Optional[models.WorkerState]) -> dict:
+    age = worker_heartbeat_age(state)
+    fresh = worker_is_fresh(state)
+
+    if age is None:
+        detail = "Nenhum heartbeat recebido"
+    elif fresh:
+        detail = f"Heartbeat há {age}s"
+    else:
+        detail = f"Sem heartbeat há {age}s"
+
+    last_heartbeat = _as_utc(state.last_heartbeat) if state else None
+    return {
+        "status": "online" if fresh else "offline",
+        "detail": detail,
+        "last_heartbeat": last_heartbeat.isoformat() if last_heartbeat else None,
+        "version": state.version if state else None,
+        "watchlist_size": state.watchlist_size if state else 0,
+        "monitored_groups_count": state.monitored_groups_count if state else 0,
+    }
+
 
 @app.get("/system/health")
-async def get_health(db: Session = Depends(database.get_db)):
-    redis_status = await check_redis()
-    os_status = await check_opensearch()
+def get_health(db: Session = Depends(database.get_db)):
     db_status = check_database(db)
-    
-    worker_health = None
-    try:
-        worker_health_raw = await redis_client.get('worker:telegram:health')
-        if worker_health_raw:
-            worker_health = json.loads(worker_health_raw.decode())
-    except Exception as e:
-        logger.warning(f"Failed to fetch worker health from Redis: {e}")
+    state = get_worker_state(db)
+    fresh = worker_is_fresh(state)
+    age = worker_heartbeat_age(state)
 
     overall_status = "UP"
-    if redis_status == "DOWN" or os_status == "DOWN" or db_status == "DOWN":
-        overall_status = "DEGRADED"
-    if redis_status == "DOWN" and os_status == "DOWN" and db_status == "DOWN":
+    if db_status != "UP":
         overall_status = "DOWN"
+    elif not fresh:
+        overall_status = "DEGRADED"
 
     return {
         "status": overall_status,
         "version": VERSION,
         "components": {
-            "redis": {"status": redis_status},
-            "opensearch": {"status": os_status},
             "database": {"status": db_status},
-            "worker": worker_health
-        }
+            "worker": {
+                "status": "UP" if fresh else "DOWN",
+                "telegram_status": state.status if state else "offline",
+                "last_heartbeat": (
+                    _as_utc(state.last_heartbeat).isoformat()
+                    if state and state.last_heartbeat
+                    else None
+                ),
+                "heartbeat_age_seconds": age,
+            },
+        },
     }
 
+
 @app.get("/system/status")
-async def get_system_status():
-    status = {
-        "telegram": {"status": "offline", "detail": "Desconectado"},
-        "opensearch": {"status": "offline", "detail": "Indisponível"},
-        "redis": {"status": "offline", "detail": "Indisponível"},
-        "stats": {"analyzed_messages": 0}
+def get_system_status(db: Session = Depends(database.get_db)):
+    state = get_worker_state(db)
+    analyzed_total = state.analyzed_total if state else 0
+    alerts_count = db.query(models.Alert).count()
+
+    return {
+        "telegram": telegram_status_payload(state),
+        "worker": worker_status_payload(state),
+        "database": {"status": "online", "detail": "SQLite"},
+        "stats": {
+            "analyzed_messages": analyzed_total,
+            "alerts": alerts_count,
+        },
     }
-    
-    # Check Redis
-    try:
-        if await redis_client.ping():
-            status["redis"]["status"] = "online"
-            status["redis"]["detail"] = "Conectado"
-            
-            # Get analyzed messages count
-            analyzed_messages = await redis_client.get('stats:analyzed_messages')
-            if analyzed_messages:
-                status["stats"]["analyzed_messages"] = int(analyzed_messages)
-    except Exception as e:
-        logger.warning(f"Falha ao conectar no Redis (status ping): {e}")
-        
-    # Check Telegram Worker (via Redis key)
-    try:
-        worker_status = await redis_client.get('worker:telegram:status')
-        if worker_status:
-            status_str = worker_status.decode()
-            if status_str == 'connected':
-                status["telegram"]["status"] = "online"
-                status["telegram"]["detail"] = "Conectado"
-            elif status_str == 'waiting_for_code':
-                status["telegram"]["status"] = "waiting_for_code"
-                status["telegram"]["detail"] = "Aguardando Código"
-            elif status_str == 'waiting_for_password':
-                status["telegram"]["status"] = "waiting_for_password"
-                status["telegram"]["detail"] = "Aguardando Senha 2FA"
-            elif status_str == 'restarting':
-                status["telegram"]["status"] = "restarting"
-                status["telegram"]["detail"] = "Aguardando Telegram"
-            elif status_str == 'error':
-                status["telegram"]["status"] = "error"
-                status["telegram"]["detail"] = "Erro de Autenticação"
-    except Exception as e:
-        logger.warning(f"Falha ao checar status do worker no Redis: {e}")
-        
-    # Check OpenSearch
-    opensearch_url = os.getenv('OPENSEARCH_URL', 'http://localhost:9200')
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(opensearch_url)
-            if response.status_code == 200:
-                stats_response = await client.get(f"{opensearch_url}/_stats/docs")
-                if stats_response.status_code == 200:
-                    stats_data = stats_response.json()
-                    indices_count = len(stats_data.get('indices', {}))
-                    status["opensearch"]["status"] = "online"
-                    status["opensearch"]["detail"] = f"{indices_count} índices"
-                else:
-                    status["opensearch"]["status"] = "online"
-                    status["opensearch"]["detail"] = "Conectado"
-    except Exception as e:
-        logger.warning(f"Falha ao conectar no OpenSearch (status): {e}")
-        
-    return status
+
 
 @app.get("/watchlist/", response_model=list[schemas.WatchlistResponse])
 def read_watchlist(
@@ -219,8 +328,9 @@ def read_watchlist(
 ):
     return db.query(models.Watchlist).offset(skip).limit(limit).all()
 
+
 @app.post("/watchlist/", response_model=schemas.WatchlistResponse)
-async def create_watchlist_item(item: schemas.WatchlistCreate, db: Session = Depends(database.get_db)):
+def create_watchlist_item(item: schemas.WatchlistCreate, db: Session = Depends(database.get_db)):
     value = item.value.strip()
     target_type = item.target_type.strip().lower()
 
@@ -236,16 +346,16 @@ async def create_watchlist_item(item: schemas.WatchlistCreate, db: Session = Dep
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
-
-    # Publish to Redis for Worker
-    message = {"action": "add", "value": value, "target_type": target_type}
-    await redis_client.publish("watchlist_updates", json.dumps(message))
     logger.info("Watchlist item adicionado.")
 
     return db_item
 
+
 @app.post("/watchlist/bulk", response_model=schemas.WatchlistBulkResult)
-async def bulk_create_watchlist_items(payload: schemas.WatchlistBulkCreate, db: Session = Depends(database.get_db)):
+def bulk_create_watchlist_items(
+    payload: schemas.WatchlistBulkCreate,
+    db: Session = Depends(database.get_db),
+):
     added = []
     skipped_duplicates = []
     invalid = []
@@ -277,11 +387,6 @@ async def bulk_create_watchlist_items(payload: schemas.WatchlistBulkCreate, db: 
         db.commit()
         for db_item in added:
             db.refresh(db_item)
-            try:
-                message = {"action": "add", "value": db_item.value, "target_type": db_item.target_type}
-                await redis_client.publish("watchlist_updates", json.dumps(message))
-            except Exception as e:
-                logger.warning(f"Falha ao publicar atualização da watchlist no Redis: {e}")
 
     logger.info(
         f"Importação de watchlist: {len(added)} adicionados, "
@@ -297,22 +402,20 @@ async def bulk_create_watchlist_items(payload: schemas.WatchlistBulkCreate, db: 
         "invalid_count": len(invalid),
     }
 
+
 @app.delete("/watchlist/{item_id}")
-async def delete_watchlist_item(item_id: int, db: Session = Depends(database.get_db)):
+def delete_watchlist_item(item_id: int, db: Session = Depends(database.get_db)):
     db_item = db.query(models.Watchlist).filter(models.Watchlist.id == item_id).first()
     if not db_item:
         logger.warning(f"Tentativa de deletar target não encontrado: {item_id}")
         raise HTTPException(status_code=404, detail="Item not found")
-    
-    value = db_item.value
+
     db.delete(db_item)
     db.commit()
-
-    message = {"action": "remove", "value": value}
-    await redis_client.publish("watchlist_updates", json.dumps(message))
     logger.info("Watchlist item removido.")
 
     return {"ok": True}
+
 
 @app.get("/groups/", response_model=list[schemas.MonitoredGroupResponse])
 def read_groups(
@@ -322,8 +425,9 @@ def read_groups(
 ):
     return db.query(models.MonitoredGroup).offset(skip).limit(limit).all()
 
+
 @app.post("/groups/", response_model=schemas.MonitoredGroupResponse)
-async def create_group(group: schemas.MonitoredGroupCreate, db: Session = Depends(database.get_db)):
+def create_group(group: schemas.MonitoredGroupCreate, db: Session = Depends(database.get_db)):
     name = group.name.strip()
     if not name or any(ch.isspace() for ch in name):
         raise HTTPException(status_code=422, detail="Invalid group name")
@@ -335,15 +439,16 @@ async def create_group(group: schemas.MonitoredGroupCreate, db: Session = Depend
     db.add(db_group)
     db.commit()
     db.refresh(db_group)
-
-    message = {"action": "add", "name": db_group.name}
-    await redis_client.publish("group_updates", json.dumps(message))
     logger.info("Grupo monitorado adicionado.")
 
     return db_group
 
+
 @app.post("/groups/bulk", response_model=schemas.GroupBulkResult)
-async def bulk_create_groups(payload: schemas.GroupBulkCreate, db: Session = Depends(database.get_db)):
+def bulk_create_groups(
+    payload: schemas.GroupBulkCreate,
+    db: Session = Depends(database.get_db),
+):
     added = []
     skipped_duplicates = []
     invalid = []
@@ -374,11 +479,6 @@ async def bulk_create_groups(payload: schemas.GroupBulkCreate, db: Session = Dep
         db.commit()
         for db_group in added:
             db.refresh(db_group)
-            try:
-                message = {"action": "add", "name": db_group.name}
-                await redis_client.publish("group_updates", json.dumps(message))
-            except Exception as e:
-                logger.warning(f"Falha ao publicar atualização de grupos no Redis: {e}")
 
     logger.info(
         f"Importação de grupos: {len(added)} adicionados, "
@@ -394,22 +494,21 @@ async def bulk_create_groups(payload: schemas.GroupBulkCreate, db: Session = Dep
         "invalid_count": len(invalid),
     }
 
+
 @app.delete("/groups/{group_id}")
-async def delete_group(group_id: int, db: Session = Depends(database.get_db)):
+def delete_group(group_id: int, db: Session = Depends(database.get_db)):
     db_group = db.query(models.MonitoredGroup).filter(models.MonitoredGroup.id == group_id).first()
     if not db_group:
         logger.warning(f"Tentativa de deletar grupo não encontrado: {group_id}")
         raise HTTPException(status_code=404, detail="Group not found")
-    
+
     name = db_group.name
     db.delete(db_group)
     db.commit()
-    
-    message = {"action": "remove", "name": name}
-    await redis_client.publish("group_updates", json.dumps(message))
     logger.info(f"Grupo monitorado removido: {name}")
-    
+
     return {"ok": True}
+
 
 def _credentials_response(creds: models.Credentials, reveal_secret: bool = False):
     if reveal_secret:
@@ -453,12 +552,14 @@ def save_credentials(creds: schemas.CredentialsCreate, db: Session = Depends(dat
     db.refresh(db_creds)
     return _credentials_response(db_creds)
 
+
 @app.get("/credentials/{service}", response_model=schemas.CredentialsResponse)
 def get_credentials(service: str, db: Session = Depends(database.get_db)):
     db_creds = db.query(models.Credentials).filter(models.Credentials.service == service).first()
     if not db_creds:
         raise HTTPException(status_code=404, detail="Credentials not found")
     return _credentials_response(db_creds)
+
 
 @app.get(
     "/internal/credentials/{service}",
@@ -472,88 +573,270 @@ def get_credentials_for_worker(service: str, db: Session = Depends(database.get_
         raise HTTPException(status_code=404, detail="Credentials not found")
     return _credentials_response(db_creds, reveal_secret=True)
 
+
 @app.post("/telegram/auth-code")
-async def submit_telegram_auth_code(data: schemas.TelegramAuthCode):
-    await redis_client.publish("telegram_auth", data.model_dump_json())
-    logger.info("Código de autenticação do Telegram enviado via Redis.")
+def submit_telegram_auth_code(data: schemas.TelegramAuthCode):
+    if not data.code and not data.password:
+        raise HTTPException(status_code=422, detail="code or password is required")
+
+    if data.code:
+        worker_commands.add("auth_code", code=data.code)
+    if data.password:
+        worker_commands.add("auth_password", password=data.password)
+
+    logger.info("Informação temporária de autenticação do Telegram recebida.")
     return {"ok": True}
 
 
 @app.post("/telegram/new-session")
-async def start_new_telegram_session():
+def start_new_telegram_session(db: Session = Depends(database.get_db)):
     """Asks the worker to log out so a fresh code/2FA login is required."""
-    try:
-        worker_status = await redis_client.get('worker:telegram:status')
-    except Exception as e:
-        logger.error(f"Falha ao consultar o status do worker no Redis: {e}")
-        raise HTTPException(status_code=503, detail="Não foi possível consultar o worker")
-
-    if worker_status != b'connected':
+    state = get_worker_state(db)
+    if not worker_connected(state):
         raise HTTPException(status_code=409, detail="O Telegram não está conectado")
 
-    await redis_client.publish("telegram_session", json.dumps({"action": "reset"}))
+    worker_commands.add("reset_session")
     logger.info("Nova sessão do Telegram solicitada pela UI.")
     return {"ok": True}
 
 
-async def redis_listener(request: Request):
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe('new_alert', 'stats_updates')
+@app.get("/internal/monitoring-config", response_model=schemas.MonitoringConfigResponse, include_in_schema=False)
+def get_monitoring_config(db: Session = Depends(database.get_db)):
+    """Full configuration snapshot consumed periodically by the worker."""
+    watchlist = (
+        db.query(models.Watchlist)
+        .filter(models.Watchlist.is_active.is_(True))
+        .all()
+    )
+    groups = db.query(models.MonitoredGroup).all()
+
+    return {
+        "watchlist": [
+            {"value": item.value, "target_type": item.target_type}
+            for item in watchlist
+        ],
+        "groups": [{"name": group.name} for group in groups],
+        "generated_at": utcnow(),
+    }
+
+
+@app.get("/internal/worker/commands", include_in_schema=False)
+def consume_worker_commands():
+    """Consumes transient UI commands. Values are never persisted."""
+    return {"commands": worker_commands.consume_all()}
+
+
+@app.get("/internal/worker/status", include_in_schema=False)
+def get_worker_status(db: Session = Depends(database.get_db)):
+    state = get_worker_state(db)
+    return {
+        "connected": worker_connected(state),
+        "fresh": worker_is_fresh(state),
+        "telegram_status": state.status if state else "offline",
+        "last_heartbeat": (
+            _as_utc(state.last_heartbeat).isoformat()
+            if state and state.last_heartbeat
+            else None
+        ),
+        "heartbeat_age_seconds": worker_heartbeat_age(state),
+    }
+
+
+@app.post("/internal/worker/heartbeat")
+async def receive_worker_heartbeat(
+    heartbeat: schemas.WorkerHeartbeat,
+    db: Session = Depends(database.get_db),
+):
+    state = get_worker_state(db)
+    if state is None:
+        state = models.WorkerState(id=1)
+        db.add(state)
+
+    previous_instance = state.instance_id
+    previous_count = state.last_analyzed_count or 0
+
+    if previous_instance == heartbeat.instance_id and heartbeat.analyzed_messages >= previous_count:
+        delta = heartbeat.analyzed_messages - previous_count
+    else:
+        # A new worker process reports its local counter from zero.
+        delta = heartbeat.analyzed_messages
+
+    state.status = heartbeat.status
+    state.version = heartbeat.version
+    state.instance_id = heartbeat.instance_id
+    state.last_heartbeat = utcnow()
+    state.last_analyzed_count = heartbeat.analyzed_messages
+    state.analyzed_total = (state.analyzed_total or 0) + delta
+    state.watchlist_size = heartbeat.watchlist_size
+    state.monitored_groups_count = heartbeat.monitored_groups_count
+
+    db.commit()
+
+    if delta > 0:
+        event_broker.publish({"analyzed_messages": state.analyzed_total})
+
+    return {"ok": True, "analyzed_messages": state.analyzed_total}
+
+
+@app.post("/internal/alerts", response_model=schemas.AlertIngestResult)
+async def ingest_alert(
+    data: schemas.AlertCreate,
+    response: Response,
+    db: Session = Depends(database.get_db),
+):
+    """Persist a hit from the worker. Idempotent by Telegram message identity."""
+    existing = (
+        db.query(models.Alert)
+        .filter(
+            models.Alert.telegram_group_id == data.telegram_group_id,
+            models.Alert.telegram_message_id == data.telegram_message_id,
+        )
+        .first()
+    )
+    if existing:
+        response.status_code = 200
+        return {
+            "status": "duplicate",
+            "alert": schemas.AlertResponse.model_validate(existing),
+        }
+
+    alert = models.Alert(
+        id=str(uuid.uuid4()),
+        target_value=data.target_value,
+        target_type=data.target_type,
+        telegram_group_id=data.telegram_group_id,
+        telegram_group_name=data.telegram_group_name,
+        telegram_message_id=data.telegram_message_id,
+        message_text=data.message_text,
+        timestamp=_as_utc(data.timestamp) or utcnow(),
+        received_at=utcnow(),
+    )
+    db.add(alert)
+
     try:
-        ping_counter = 0
+        db.commit()
+        db.refresh(alert)
+    except IntegrityError:
+        # Another concurrent retry inserted the same message first.
+        db.rollback()
+        existing = (
+            db.query(models.Alert)
+            .filter(
+                models.Alert.telegram_group_id == data.telegram_group_id,
+                models.Alert.telegram_message_id == data.telegram_message_id,
+            )
+            .first()
+        )
+        if not existing:
+            raise
+        response.status_code = 200
+        return {
+            "status": "duplicate",
+            "alert": schemas.AlertResponse.model_validate(existing),
+        }
+
+    response.status_code = 201
+    serialized = schemas.AlertResponse.model_validate(alert).model_dump(mode="json")
+    # Notify the dashboard only after the alert is safely persisted.
+    event_broker.publish(serialized)
+    logger.info("Novo alerta persistido.")
+
+    return {"status": "created", "alert": serialized}
+
+
+def _like_pattern(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped}%"
+
+
+@app.get("/feed/history", response_model=list[schemas.AlertResponse])
+def get_feed_history(
+    limit: int = Query(50, ge=1, le=500),
+    skip: int = Query(0, ge=0),
+    q: Optional[str] = Query(None, max_length=200),
+    target: Optional[str] = Query(None, max_length=320),
+    target_type: Optional[str] = Query(None, max_length=16),
+    group: Optional[str] = Query(None, max_length=255),
+    start: Optional[datetime] = Query(None),
+    end: Optional[datetime] = Query(None),
+    db: Session = Depends(database.get_db),
+):
+    query = db.query(models.Alert)
+
+    if q and q.strip():
+        pattern = _like_pattern(q.strip())
+        query = query.filter(
+            or_(
+                models.Alert.message_text.ilike(pattern, escape="\\"),
+                models.Alert.target_value.ilike(pattern, escape="\\"),
+                models.Alert.telegram_group_name.ilike(pattern, escape="\\"),
+            )
+        )
+
+    if target and target.strip():
+        query = query.filter(
+            models.Alert.target_value.ilike(
+                _like_pattern(target.strip()), escape="\\"
+            )
+        )
+
+    if target_type and target_type.strip():
+        query = query.filter(models.Alert.target_type == target_type.strip().lower())
+
+    if group and group.strip():
+        group_value = group.strip()
+        query = query.filter(
+            or_(
+                models.Alert.telegram_group_name.ilike(
+                    _like_pattern(group_value), escape="\\"
+                ),
+                models.Alert.telegram_group_id == group_value,
+            )
+        )
+
+    if start:
+        query = query.filter(models.Alert.timestamp >= (_as_utc(start) or start))
+    if end:
+        query = query.filter(models.Alert.timestamp <= (_as_utc(end) or end))
+
+    return (
+        query.order_by(models.Alert.timestamp.desc(), models.Alert.received_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+
+async def event_stream(request: Request):
+    queue = event_broker.subscribe()
+    try:
         while True:
             if await request.is_disconnected():
                 break
-                
-            message = await pubsub.get_message(ignore_subscribe_messages=True)
-            if message and message['type'] == 'message':
-                yield f"data: {message['data'].decode('utf-8')}\n\n"
-            else:
-                ping_counter += 1
-                if ping_counter >= 150: # ping every 15 seconds
-                    yield ": ping\n\n"
-                    ping_counter = 0
-                    
-            await asyncio.sleep(0.1)
-    except Exception as e:
-        logger.error(f"Erro no listener do Redis: {e}")
-    finally:
-        await pubsub.unsubscribe('new_alert', 'stats_updates')
-        await pubsub.close()
 
-@app.get("/feed/history")
-async def get_feed_history(limit: int = Query(50, ge=1, le=200)):
-    opensearch_url = os.getenv('OPENSEARCH_URL', 'http://localhost:9200')
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            query = {
-                "size": limit,
-                "sort": [
-                    {"timestamp": {"order": "desc"}}
-                ]
-            }
-            response = await client.post(f"{opensearch_url}/hits/_search", json=query)
-            if response.status_code == 200:
-                data = response.json()
-                hits = [hit["_source"] for hit in data.get("hits", {}).get("hits", [])]
-                return hits
-            elif response.status_code == 404:
-                return []
-            else:
-                logger.error(f"Erro ao buscar histórico do OpenSearch: {response.text}")
-                return []
-    except Exception as e:
-        logger.error(f"Falha ao conectar no OpenSearch (history): {e}")
-        return []
+            try:
+                message = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+
+            yield f"data: {message}\n\n"
+    finally:
+        event_broker.unsubscribe(queue)
+
 
 @app.get("/feed/stream")
 async def stream_feed(request: Request):
     return StreamingResponse(
-        redis_listener(request), 
+        event_stream(request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+            "X-Accel-Buffering": "no",
+        },
     )

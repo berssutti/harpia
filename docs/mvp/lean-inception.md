@@ -11,7 +11,7 @@
 #### A Matriz É / Não É / Faz / Não Faz
 * **É:** Open source, orientado a eventos (Event-Driven), focado em monitoramento de alvos (Watchlist), conteinerizado (Docker).
 * **Não É:** Um motor de busca global de todo o cibercrime brasileiro, um bot de interação no Telegram, uma ferramenta de *takedown*.
-* **Faz:** Mantém uma Watchlist em memória para filtragem ultra-rápida, indexa apenas os alertas positivos (Hits) no OpenSearch, atualiza a lista de alvos em tempo real via *Pub/Sub*.
+* **Faz:** Mantém uma Watchlist em memória para filtragem ultra-rápida, persiste apenas os alertas positivos (Hits) no SQLite e sincroniza a lista de alvos por polling HTTP periódico.
 * **Não Faz (No MVP):** Não armazena mensagens que não dão *match* com a Watchlist, **não envia notificações (Webhook, Slack, E-mail)**.
 
 #### Personas

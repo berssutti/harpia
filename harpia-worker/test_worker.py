@@ -1,44 +1,74 @@
-import unittest.mock as mock
-import pytest
-import json
-from .main import fetch_initial_watchlist, fetch_initial_groups, watchlist, monitored_groups
+import main
 
-def test_fetch_initial_watchlist():
-    mock_data = [
-        {"value": "test@example.com", "target_type": "email", "is_active": True},
-        {"value": "ignored@example.com", "target_type": "email", "is_active": False}
-    ]
-    
-    with mock.patch("urllib.request.urlopen") as mock_url:
-        mock_response = mock.MagicMock()
-        mock_response.read.return_value = json.dumps(mock_data).encode()
-        mock_response.__enter__.return_value = mock_response
-        mock_url.return_value = mock_response
-        
-        fetch_initial_watchlist()
-        
-        assert "test@example.com" in watchlist
-        assert "ignored@example.com" not in watchlist
 
-def test_fetch_initial_groups():
-    mock_data = [
-        {"name": "@testgroup"},
-        {"name": "1234567"}
-    ]
-    
-    with mock.patch("urllib.request.urlopen") as mock_url:
-        mock_response = mock.MagicMock()
-        mock_response.read.return_value = json.dumps(mock_data).encode()
-        mock_response.__enter__.return_value = mock_response
-        mock_url.return_value = mock_response
-        
-        fetch_initial_groups()
-        
-        assert "testgroup" in monitored_groups
-        assert "1234567" in monitored_groups
+def reset_state():
+    main.watchlist.clear()
+    main.monitored_groups.clear()
+    main.recent_processed.clear()
+    main.analyzed_messages = 0
+    main.worker_status["analyzed_messages"] = 0
 
-@pytest.mark.asyncio
-async def test_worker_handler_logic():
-    # This is a placeholder for a more complex Telethon event test
-    # In a real scenario, we would mock the 'event' object
-    assert True
+
+def test_apply_monitoring_config_replaces_snapshot():
+    reset_state()
+
+    changed = main.apply_monitoring_config(
+        {
+            "watchlist": [
+                {"value": "Test@Example.com", "target_type": "email"},
+                {"value": "empresa.com", "target_type": "domain"},
+            ],
+            "groups": [{"name": "@TestGroup"}, {"name": "1234567"}],
+        }
+    )
+
+    assert changed is True
+    assert main.watchlist["test@example.com"] == ("Test@Example.com", "email")
+    assert "empresa.com" in main.watchlist
+    assert main.monitored_groups == {"testgroup", "1234567"}
+
+    unchanged = main.apply_monitoring_config(
+        {
+            "watchlist": [
+                {"value": "Test@Example.com", "target_type": "email"},
+                {"value": "empresa.com", "target_type": "domain"},
+            ],
+            "groups": [{"name": "@TestGroup"}, {"name": "1234567"}],
+        }
+    )
+    assert unchanged is False
+
+    replaced = main.apply_monitoring_config(
+        {
+            "watchlist": [{"value": "novo.com", "target_type": "domain"}],
+            "groups": [{"name": "@Outro"}],
+        }
+    )
+    assert replaced is True
+    assert main.watchlist == {"novo.com": ("novo.com", "domain")}
+    assert main.monitored_groups == {"outro"}
+
+
+def test_apply_monitoring_config_ignores_empty_items():
+    reset_state()
+
+    main.apply_monitoring_config(
+        {
+            "watchlist": [{"value": "", "target_type": "email"}],
+            "groups": [{"name": ""}],
+        }
+    )
+
+    assert main.watchlist == {}
+    assert main.monitored_groups == set()
+
+
+def test_mark_message_analyzed_deduplicates_recent_events():
+    reset_state()
+
+    main.mark_message_analyzed(123, 1)
+    main.mark_message_analyzed(123, 1)
+    main.mark_message_analyzed(123, 2)
+
+    assert main.analyzed_messages == 2
+    assert main.worker_status["analyzed_messages"] == 2

@@ -14,8 +14,6 @@ services:
       - NUXT_UI_USER=${HARPIA_UI_USER:-admin}
       - NUXT_UI_PASSWORD=${HARPIA_UI_PASSWORD:?HARPIA_UI_PASSWORD must be set in .env}
     depends_on:
-      - opensearch
-      - redis
       - harpia-backend
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
@@ -30,13 +28,10 @@ services:
     ports:
       - "${HARPIA_BIND_ADDR:-127.0.0.1}:8000:8000"
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
-      - OPENSEARCH_URL=http://opensearch:9200
       - HARPIA_API_KEY=${HARPIA_API_KEY:?HARPIA_API_KEY must be set in .env}
       - HARPIA_CORS_ORIGINS=${HARPIA_CORS_ORIGINS:-}
-    depends_on:
-      - redis
-      - opensearch
+      - WORKER_STALE_AFTER_SECONDS=${WORKER_STALE_AFTER_SECONDS:-90}
+      - TELEGRAM_COMMAND_TTL_SECONDS=${TELEGRAM_COMMAND_TTL_SECONDS:-600}
     volumes:
       - ./harpia-backend/db:/app/db
     healthcheck:
@@ -50,49 +45,25 @@ services:
     build:
       context: ./harpia-worker
     environment:
-      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}@redis:6379/0
-      - OPENSEARCH_URL=http://opensearch:9200
       - BACKEND_URL=http://harpia-backend:8000
       - HARPIA_API_KEY=${HARPIA_API_KEY:?HARPIA_API_KEY must be set in .env}
+      - WORKER_CONFIG_POLL_SECONDS=${WORKER_CONFIG_POLL_SECONDS:-30}
+      - WORKER_HEARTBEAT_SECONDS=${WORKER_HEARTBEAT_SECONDS:-15}
+      - WORKER_COMMAND_POLL_SECONDS=${WORKER_COMMAND_POLL_SECONDS:-2}
     depends_on:
-      - redis
-      - opensearch
       - harpia-backend
     volumes:
       - ./harpia-worker/session:/app/session
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import os, redis; r = redis.from_url(os.environ[\"REDIS_URL\"]); exit(0 if r.get(\"worker:telegram:status\") == b\"connected\" else 1)'"]
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json, os, urllib.request;
+          req = urllib.request.Request(os.environ['BACKEND_URL'] + '/internal/worker/status',
+          headers={'X-API-Key': os.environ['HARPIA_API_KEY']});
+          data = json.load(urllib.request.urlopen(req, timeout=5));
+          raise SystemExit(0 if data.get('connected') else 1)"
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
-
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"]
-    environment:
-      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  opensearch:
-    image: opensearchproject/opensearch:2.11.0
-    environment:
-      - discovery.type=single-node
-      - DISABLE_SECURITY_PLUGIN=true
-    volumes:
-      - opensearch-data:/usr/share/opensearch/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9200/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-volumes:
-  opensearch-data:
-  redis-data:
