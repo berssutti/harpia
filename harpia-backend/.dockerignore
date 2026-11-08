@@ -4,4 +4,3 @@ __pycache__
 .pytest_cache
 db/
 *.db
-test_*.py

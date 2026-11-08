@@ -252,18 +252,18 @@ const serviceStatuses = computed(() => {
       offlineLabel: 'Desconectado'
     },
     {
-      key: 'opensearch',
-      label: 'OpenSearch',
-      detail: status.opensearch?.detail || 'Sem detalhes',
-      online: status.opensearch?.status === 'online',
+      key: 'worker',
+      label: 'Worker de Ingestão',
+      detail: status.worker?.detail || 'Sem detalhes',
+      online: status.worker?.status === 'online',
       onlineLabel: 'Online',
       offlineLabel: 'Offline'
     },
     {
-      key: 'redis',
-      label: 'Redis Pub/Sub',
-      detail: status.redis?.detail || 'Sem detalhes',
-      online: status.redis?.status === 'online',
+      key: 'database',
+      label: 'Banco de Dados',
+      detail: status.database?.detail || 'Sem detalhes',
+      online: status.database?.status === 'online',
       onlineLabel: 'Online',
       offlineLabel: 'Offline'
     }

@@ -1,57 +1,266 @@
 from loguru import logger
-import redis
-import json
-import threading
-import os
 import asyncio
+import os
 import time
-import urllib.request
-import urllib.error
-from telethon import TelegramClient, events, errors
-from opensearchpy import OpenSearch
-from datetime import datetime, timezone
-from contextlib import suppress
-from pathlib import Path
 import uuid
+from contextlib import suppress
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
-VERSION = "0.1.0"
-watchlist = {} # Stores: { value.lower(): target_type }
-monitored_groups = set() # Stores normalized group names/ids
+import httpx
+from telethon import TelegramClient, events, errors
 
-# Use REDIS_URL from env if available (docker-compose sets this)
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-redis_client = redis.from_url(REDIS_URL)
+VERSION = "0.2.0"
 
-OPENSEARCH_URL = os.getenv('OPENSEARCH_URL', 'http://localhost:9200')
-os_client = OpenSearch(hosts=[OPENSEARCH_URL], use_ssl=False)
+# In-memory configuration. The API is the source of truth; this copy is only
+# replaced after a complete snapshot is fetched successfully.
+watchlist: dict[str, tuple[str, str]] = {}  # lower(value) -> (original value, type)
+monitored_groups: set[str] = set()  # normalized names/ids
 
-BACKEND_URL = os.getenv('BACKEND_URL', 'http://harpia-backend:8000')
-BACKEND_API_KEY = os.getenv('HARPIA_API_KEY', '').strip()
+BACKEND_URL = os.getenv("BACKEND_URL", "http://harpia-backend:8000").rstrip("/")
+BACKEND_API_KEY = os.getenv("HARPIA_API_KEY", "").strip()
+CREDENTIALS_ENDPOINT = "/internal/credentials/telegram"
+SESSION_PATH = Path("session/harpia_session.session")
+INSTANCE_ID = uuid.uuid4().hex
 
-# The worker is the only client allowed to read the plaintext Telegram secret.
-CREDENTIALS_ENDPOINT = '/internal/credentials/telegram'
-SESSION_PATH = Path('session/harpia_session.session')
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+CONFIG_POLL_SECONDS = _positive_int_env("WORKER_CONFIG_POLL_SECONDS", 30)
+HEARTBEAT_SECONDS = _positive_int_env("WORKER_HEARTBEAT_SECONDS", 15)
+COMMAND_POLL_SECONDS = _positive_int_env("WORKER_COMMAND_POLL_SECONDS", 2)
+ALERT_QUEUE_SIZE = _positive_int_env("WORKER_ALERT_QUEUE_SIZE", 1000)
+
+http_client: Optional[httpx.AsyncClient] = None
+
+worker_status = {
+    "status": "starting",
+    "analyzed_messages": 0,
+}
+heartbeat_wakeup = asyncio.Event()
+
+
+def set_worker_status(status: str) -> None:
+    worker_status["status"] = status
+    heartbeat_wakeup.set()
+
+# Guards against duplicated Telethon event deliveries during a short window.
+recent_processed: dict[str, float] = {}
+analyzed_messages = 0
+alert_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=ALERT_QUEUE_SIZE)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def apply_monitoring_config(data: dict) -> bool:
+    """Replace the in-memory snapshot only after a full payload is parsed."""
+    new_watchlist: dict[str, tuple[str, str]] = {}
+    for item in data.get("watchlist") or []:
+        value = str(item.get("value") or "").strip()
+        if not value:
+            continue
+        target_type = str(item.get("target_type") or "unknown")
+        new_watchlist[value.lower()] = (value, target_type)
+
+    new_groups: set[str] = set()
+    for group in data.get("groups") or []:
+        name = str(group.get("name") or "").strip()
+        if not name:
+            continue
+        new_groups.add(name.lower().replace("@", ""))
+
+    changed = new_watchlist != watchlist or new_groups != monitored_groups
+    watchlist.clear()
+    watchlist.update(new_watchlist)
+    monitored_groups.clear()
+    monitored_groups.update(new_groups)
+
+    if changed:
+        logger.info(
+            f"Monitoramento atualizado: {len(watchlist)} alvos e "
+            f"{len(monitored_groups)} grupos."
+        )
+    return changed
+
+
+async def api_request(
+    method: str,
+    path: str,
+    *,
+    json_body: Optional[dict] = None,
+    retries: int = 3,
+    timeout: float = 10.0,
+) -> httpx.Response:
+    if http_client is None:
+        raise RuntimeError("HTTP client is not initialized")
+
+    last_error: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            response = await http_client.request(
+                method,
+                path,
+                json=json_body,
+                timeout=timeout,
+            )
+            if response.status_code >= 500 or response.status_code == 429:
+                last_error = httpx.HTTPStatusError(
+                    f"Backend returned {response.status_code}",
+                    request=response.request,
+                    response=response,
+                )
+            else:
+                return response
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = exc
+
+        if attempt + 1 < retries:
+            await asyncio.sleep(min(2 ** attempt, 5))
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("HTTP request failed without a response")
+
+
+async def refresh_monitoring_config() -> bool:
+    try:
+        response = await api_request("GET", "/internal/monitoring-config", retries=2)
+        if response.status_code != 200:
+            logger.warning(
+                f"Backend returned {response.status_code} when fetching configuration."
+            )
+            return False
+        apply_monitoring_config(response.json())
+        return True
+    except Exception as exc:
+        logger.warning(f"Failed to fetch monitoring configuration: {exc}")
+        return False
+
+
+async def config_poll_loop():
+    delay = CONFIG_POLL_SECONDS
+    while True:
+        ok = await refresh_monitoring_config()
+        if ok:
+            delay = CONFIG_POLL_SECONDS
+        else:
+            delay = min(delay * 2, 60)
+        await asyncio.sleep(delay)
+
+
+async def heartbeat_loop():
+    last_error_log = 0.0
+    while True:
+        payload = {
+            "status": worker_status["status"],
+            "version": VERSION,
+            "instance_id": INSTANCE_ID,
+            "analyzed_messages": analyzed_messages,
+            "watchlist_size": len(watchlist),
+            "monitored_groups_count": len(monitored_groups),
+        }
+        try:
+            response = await api_request(
+                "POST",
+                "/internal/worker/heartbeat",
+                json_body=payload,
+                retries=2,
+            )
+            if response.status_code not in (200, 201):
+                raise RuntimeError(f"Backend returned {response.status_code}")
+        except Exception as exc:
+            now = time.monotonic()
+            if now - last_error_log >= 60:
+                logger.warning(f"Failed to send worker heartbeat: {exc}")
+                last_error_log = now
+
+        try:
+            await asyncio.wait_for(heartbeat_wakeup.wait(), timeout=HEARTBEAT_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        heartbeat_wakeup.clear()
+
+
+async def fetch_worker_commands() -> list[dict]:
+    try:
+        response = await api_request(
+            "GET",
+            "/internal/worker/commands",
+            retries=2,
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                f"Backend returned {response.status_code} when fetching commands."
+            )
+            return []
+        return response.json().get("commands", [])
+    except Exception as exc:
+        logger.debug(f"Failed to fetch worker commands: {exc}")
+        return []
+
+
+async def wait_for_credentials() -> tuple[str, str, str]:
+    logger.info("Waiting for Telegram credentials to be configured in the UI...")
+    while True:
+        try:
+            response = await api_request("GET", CREDENTIALS_ENDPOINT, retries=2)
+            if response.status_code == 200:
+                creds = response.json()
+                if creds.get("api_id") and creds.get("api_hash") and creds.get("phone"):
+                    logger.info("Telegram credentials found in the database.")
+                    return creds["api_id"], creds["api_hash"], creds["phone"]
+        except Exception as exc:
+            logger.debug(f"Failed to fetch Telegram credentials: {exc}")
+        await asyncio.sleep(5)
+
+
+async def wait_for_credentials_change(last_api_id: str, last_api_hash: str):
+    while True:
+        await asyncio.sleep(5)
+        try:
+            response = await api_request("GET", CREDENTIALS_ENDPOINT, retries=1)
+            if response.status_code != 200:
+                continue
+            creds = response.json()
+            if creds.get("api_id") != last_api_id or creds.get("api_hash") != last_api_hash:
+                logger.info("Credentials updated, restarting client...")
+                return
+        except Exception:
+            continue
 
 
 def remove_session_file():
     try:
         SESSION_PATH.unlink(missing_ok=True)
         logger.info("Arquivo de sessão local removido.")
-    except OSError as e:
-        logger.error(f"Falha ao remover arquivo de sessão: {e}")
+    except OSError as exc:
+        logger.error(f"Falha ao remover arquivo de sessão: {exc}")
 
 
-async def end_current_session(client):
+async def end_current_session(client: TelegramClient):
     """Ends the worker session so the next client must request a fresh code."""
     logger.info("Nova sessão solicitada. Encerrando a sessão atual do Telegram...")
+    set_worker_status("restarting")
     try:
         logged_out = await client.log_out()
         if logged_out:
             logger.info("Sessão encerrada no Telegram.")
         else:
-            logger.warning("O Telegram não confirmou o encerramento; removendo apenas a sessão local.")
-    except Exception as e:
-        logger.error(f"Falha ao encerrar a sessão no Telegram: {e}")
+            logger.warning(
+                "O Telegram não confirmou o encerramento; removendo apenas a sessão local."
+            )
+    except Exception as exc:
+        logger.error(f"Falha ao encerrar a sessão no Telegram: {exc}")
     finally:
         # log_out() deletes the file on success; removing it again is harmless
         # and guarantees the next client starts unauthenticated.
@@ -61,329 +270,296 @@ async def end_current_session(client):
                 await client.disconnect()
             except Exception:
                 pass
+
+
+async def monitor_session_commands(client: TelegramClient, session_ending: asyncio.Event):
+    """Listens for a reset request coming from the backend (UI action)."""
+    while not session_ending.is_set():
+        commands = await fetch_worker_commands()
+        if any(command.get("type") == "reset_session" for command in commands):
+            session_ending.set()
+            await end_current_session(client)
+            return
+        await asyncio.sleep(COMMAND_POLL_SECONDS)
+
+
+async def wait_for_auth_value(expected_key: str):
+    """Polls transient commands until the expected value or a reset arrives."""
+    while True:
+        commands = await fetch_worker_commands()
+        for command in commands:
+            if command.get("type") == "reset_session":
+                return None
+            if expected_key == "code" and command.get("type") == "auth_code":
+                if command.get("code"):
+                    return command["code"]
+            if expected_key == "password" and command.get("type") == "auth_password":
+                if command.get("password"):
+                    return command["password"]
+        await asyncio.sleep(COMMAND_POLL_SECONDS)
+
+
+async def authenticate(client: TelegramClient, phone: str) -> bool:
+    """Drives the interactive login. Returns False when a reset was requested."""
+    if await client.is_user_authorized():
+        return True
+
+    logger.info("Sessão não autorizada. Solicitando código ao Telegram...")
+    send_code_result = await client.send_code_request(phone)
+    phone_code_hash = send_code_result.phone_code_hash
+
+    while True:
+        set_worker_status("waiting_for_code")
+        logger.info("Waiting for auth code from UI...")
+        auth_code = await wait_for_auth_value("code")
+        if auth_code is None:
+            return False
+
+        logger.info("Got code, trying to sign in...")
         try:
-            redis_client.delete('worker:telegram:status')
-        except Exception as e:
-            logger.error(f"Falha ao limpar status do worker no Redis: {e}")
-
-
-async def listen_for_session_commands(client, session_ending):
-    """Listens for reset requests coming from the backend (UI action)."""
-    pubsub = redis_client.pubsub()
-    pubsub.subscribe('telegram_session')
-    logger.info("Listening for Telegram session commands on Redis.")
-    try:
-        while not session_ending.is_set():
-            message = pubsub.get_message(ignore_subscribe_messages=True)
-            if message:
+            await client.sign_in(
+                phone=phone,
+                code=auth_code,
+                phone_code_hash=phone_code_hash,
+            )
+            logger.info("Login realizado com sucesso!")
+            return True
+        except errors.SessionPasswordNeededError:
+            logger.warning("2FA Password needed!")
+            while True:
+                set_worker_status("waiting_for_password")
+                password = await wait_for_auth_value("password")
+                if password is None:
+                    return False
+                logger.info("Got 2FA password, trying to sign in...")
                 try:
-                    data = json.loads(message['data'].decode('utf-8'))
-                except Exception as e:
-                    logger.error(f"Error parsing session command: {e}")
-                    data = {}
-                if data.get('action') == 'reset':
-                    session_ending.set()
-                    await end_current_session(client)
-                    return
-            await asyncio.sleep(1)
-    finally:
-        pubsub.close()
+                    await client.sign_in(password=password)
+                    logger.info("Login 2FA realizado com sucesso!")
+                    return True
+                except errors.PasswordHashInvalidError:
+                    logger.warning("Senha 2FA inválida. Aguardando nova senha...")
+        except (errors.PhoneCodeInvalidError, errors.PhoneCodeEmptyError):
+            logger.warning("Código inválido. Aguardando novo código...")
+        except errors.PhoneCodeExpiredError:
+            logger.warning("Código expirado. Solicitando um novo código...")
+            send_code_result = await client.send_code_request(phone)
+            phone_code_hash = send_code_result.phone_code_hash
 
-def listen_to_redis():
-    pubsub = redis_client.pubsub()
-    pubsub.subscribe('watchlist_updates', 'group_updates')
-    logger.info("Subscribed to Redis for watchlist and group updates.")
-    for message in pubsub.listen():
-        if message['type'] == 'message':
-            try:
-                data = json.loads(message['data'])
-                channel = message['channel'].decode('utf-8')
-                if channel == 'watchlist_updates':
-                    val = data['value'].lower()
-                    if data['action'] == 'add':
-                        watchlist[val] = data.get('target_type', 'unknown')
-                        logger.info("Watchlist target added in memory.")
-                    elif data['action'] == 'remove':
-                        watchlist.pop(val, None)
-                        logger.info("Watchlist target removed from memory.")
-                elif channel == 'group_updates':
-                    name = str(data['name']).lower().replace('@', '')
-                    if data['action'] == 'add':
-                        monitored_groups.add(name)
-                        logger.info("Monitored group added.")
-                    elif data['action'] == 'remove':
-                        monitored_groups.discard(name)
-                        logger.info("Monitored group removed.")
-            except Exception as e:
-                logger.error(f"Error processing Redis message: {e}")
 
-def get_config_from_api(endpoint):
+def mark_message_analyzed(chat_id: int, message_id: int) -> None:
+    global analyzed_messages
+
+    key = f"{chat_id}:{message_id}"
+    now = time.monotonic()
+    if key in recent_processed:
+        return
+
+    recent_processed[key] = now
+    analyzed_messages += 1
+    worker_status["analyzed_messages"] = analyzed_messages
+
+    if len(recent_processed) > 2000:
+        cutoff = now - 120
+        for old_key, seen_at in list(recent_processed.items()):
+            if seen_at < cutoff:
+                del recent_processed[old_key]
+
+
+def queue_alert(payload: dict) -> None:
     try:
-        req = urllib.request.Request(f"{BACKEND_URL}{endpoint}")
-        if BACKEND_API_KEY:
-            req.add_header('X-API-Key', BACKEND_API_KEY)
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode())
-    except Exception as e:
-        logger.debug(f"Falha ao buscar config em {endpoint}: {e}")
-        return None
+        alert_queue.put_nowait(payload)
+    except asyncio.QueueFull:
+        logger.error("Alert queue is full; dropping a hit.")
 
-def fetch_initial_watchlist():
-    logger.info("Fetching initial watchlist from API...")
-    data = get_config_from_api('/watchlist/')
-    if data:
-        for item in data:
-            if item.get('is_active'):
-                watchlist[item['value'].lower()] = item.get('target_type', 'unknown')
-        logger.info(f"Loaded {len(watchlist)} targets into memory.")
-    else:
-        logger.warning("Could not fetch initial watchlist or it is empty.")
 
-def fetch_initial_groups():
-    logger.info("Fetching initial groups from API...")
-    data = get_config_from_api('/groups/')
-    if data:
-        for g in data:
-            name = str(g['name']).lower().replace('@', '')
-            monitored_groups.add(name)
-        logger.info(f"Loaded {len(monitored_groups)} groups into memory.")
-    else:
-        logger.warning("Could not fetch initial groups or it is empty.")
-
-def wait_for_credentials():
-    logger.info("Waiting for Telegram credentials to be configured in the UI...")
+async def alert_sender_loop():
+    """Sends hits to the API and retries until the backend accepts them."""
     while True:
-        creds = get_config_from_api(CREDENTIALS_ENDPOINT)
-        if creds and creds.get('api_id') and creds.get('api_hash') and creds.get('phone'):
-            logger.info("Credentials found in the database!")
-            return creds['api_id'], creds['api_hash'], creds['phone']
-        time.sleep(5)
+        payload = await alert_queue.get()
+        try:
+            delay = 2
+            while True:
+                try:
+                    response = await api_request(
+                        "POST",
+                        "/internal/alerts",
+                        json_body=payload,
+                        retries=1,
+                        timeout=15.0,
+                    )
+                    if response.status_code in (200, 201):
+                        result = response.json()
+                        logger.info(
+                            f"Alerta enviado ao backend ({result.get('status', 'ok')})."
+                        )
+                        break
+                    if 400 <= response.status_code < 500:
+                        logger.error(
+                            "Backend rejected an alert "
+                            f"({response.status_code}): {response.text[:200]}"
+                        )
+                        break
+                except Exception as exc:
+                    logger.warning(f"Failed to send alert to backend: {exc}")
 
-async def main():
-    # Load initial watchlist and groups
-    fetch_initial_watchlist()
-    fetch_initial_groups()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+        finally:
+            alert_queue.task_done()
 
-    # Start Redis listener thread
-    threading.Thread(target=listen_to_redis, daemon=True).start()
 
+def build_event_handler():
+    async def handler(event):
+        try:
+            if not monitored_groups:
+                return
+
+            chat = await event.get_chat()
+            chat_username = getattr(chat, "username", None)
+            chat_id = str(event.chat_id)
+
+            is_monitored = chat_id in monitored_groups
+            if chat_username:
+                normalized_username = chat_username.lower().replace("@", "")
+                is_monitored = is_monitored or normalized_username in monitored_groups
+            if not is_monitored:
+                return
+
+            mark_message_analyzed(event.chat_id, event.id)
+
+            text = event.raw_text or ""
+            lowered = text.lower()
+            for target_key, (target_value, target_type) in list(watchlist.items()):
+                if not target_key or target_key not in lowered:
+                    continue
+
+                chat_name = (
+                    getattr(chat, "title", None)
+                    or chat_username
+                    or chat_id
+                )
+                queue_alert(
+                    {
+                        "target_value": target_value,
+                        "target_type": target_type,
+                        "telegram_group_id": chat_id,
+                        "telegram_group_name": str(chat_name),
+                        "telegram_message_id": str(event.id),
+                        "message_text": text,
+                        "timestamp": now_iso(),
+                    }
+                )
+                logger.info("Hit found for a monitored target!")
+                # Match the previous behavior: only the first target per message.
+                break
+        except Exception as exc:
+            logger.error(f"Error processing Telegram message: {exc}")
+
+    return handler
+
+
+async def telegram_loop():
     while True:
-        # Wait for user to configure API credentials in the backend
-        api_id, api_hash, phone = wait_for_credentials()
+        api_id, api_hash, phone = await wait_for_credentials()
 
         try:
             api_id_int = int(api_id)
         except ValueError:
             logger.error(f"Invalid API ID: '{api_id}'. API ID must be an integer.")
-            logger.info("Waiting for credentials to be updated in the database...")
-            last_api_id, last_api_hash = api_id, api_hash
-            while True:
-                await asyncio.sleep(5)
-                creds = get_config_from_api(CREDENTIALS_ENDPOINT)
-                if creds and (creds.get('api_id') != last_api_id or creds.get('api_hash') != last_api_hash):
-                    logger.info("Credentials updated, restarting client...")
-                    break
+            await wait_for_credentials_change(api_id, api_hash)
             continue
 
-        client = TelegramClient('session/harpia_session', api_id_int, api_hash)
+        client = TelegramClient("session/harpia_session", api_id_int, api_hash)
+        client.add_event_handler(
+            build_event_handler(),
+            events.NewMessage(outgoing=True, incoming=True),
+        )
 
-        @client.on(events.NewMessage(outgoing=True, incoming=True))
-        async def handler(event):
-            try:
-                chat = await event.get_chat()
-                chat_username = getattr(chat, 'username', None)
-                chat_id = str(event.chat_id)
-                
-                is_monitored = False
-                
-                # If monitored_groups is empty, we don't monitor anything to save resources
-                if not monitored_groups:
-                    return
+        command_task: Optional[asyncio.Task] = None
+        session_ending = asyncio.Event()
 
-                # Check ID
-                if chat_id in monitored_groups:
-                    is_monitored = True
-                # Check Username
-                if chat_username and chat_username.lower() in monitored_groups:
-                    is_monitored = True
-                    
-                if not is_monitored:
-                    return
-            except Exception:
-                return
-
-            # Increment and publish analyzed messages count with deduplication
-            try:
-                msg_id = f"processed:{event.chat_id}:{event.id}"
-                # Only increment if this message ID hasn't been processed in the last 60s
-                if redis_client.set(msg_id, "1", ex=60, nx=True):
-                    analyzed_count = redis_client.incr('stats:analyzed_messages')
-                    redis_client.publish('stats_updates', json.dumps({"analyzed_messages": analyzed_count}))
-            except Exception as e:
-                logger.error(f"Error updating analyzed messages count: {e}")
-
-            message_text = event.raw_text.lower()
-            for target_value, target_type in watchlist.items():
-                if target_value in message_text:
-                    # Hit!
-                    try:
-                        chat = await event.get_chat()
-                        chat_name = getattr(chat, 'title', str(event.chat_id))
-                    except Exception:
-                        chat_name = str(event.chat_id)
-                    
-                    hit_data = {
-                        "id": str(uuid.uuid4()),
-                        "target_value": target_value,
-                        "target_type": target_type,
-                        "telegram_group_id": str(event.chat_id),
-                        "telegram_group_name": chat_name,
-                        "message_text": event.raw_text,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }
-                    
-                    logger.info("Hit found for a monitored target!")
-                    
-                    try:
-                        # Index to OpenSearch
-                        await asyncio.to_thread(os_client.index, index="hits", body=hit_data)
-                        # Notify UI via Redis
-                        await asyncio.to_thread(redis_client.publish, 'new_alert', json.dumps(hit_data))
-                    except Exception as e:
-                        logger.error(f"Error pushing to external services: {e}")
-                    
-                    # Break after the first match to avoid duplicate indexing for the same message
-                    break
-
-        logger.info("Starting Telegram Client...")
         try:
+            logger.info("Starting Telegram Client...")
             await client.connect()
-            
-            if not await client.is_user_authorized():
-                logger.info("Sessão não autorizada. Solicitando código ao Telegram...")
-                send_code_result = await client.send_code_request(phone)
-                phone_code_hash = send_code_result.phone_code_hash
 
-                # Subscribe to telegram_auth channel
-                auth_pubsub = redis_client.pubsub()
-                auth_pubsub.subscribe('telegram_auth')
+            authenticated = await authenticate(client, phone)
+            if not authenticated:
+                logger.info("Autenticação reiniciada; solicitando novo código.")
+                continue
 
-                async def wait_for_auth_value(key):
-                    while True:
-                        message = auth_pubsub.get_message(ignore_subscribe_messages=True)
-                        if message:
-                            try:
-                                data = json.loads(message['data'].decode('utf-8'))
-                                if data.get(key):
-                                    return data[key]
-                            except Exception as e:
-                                logger.error(f"Error parsing auth message: {e}")
-                        await asyncio.sleep(1)
-
-                try:
-                    while True:
-                        # Update status
-                        redis_client.set('worker:telegram:status', 'waiting_for_code')
-                        logger.info("Waiting for auth code from UI...")
-                        auth_code = await wait_for_auth_value('code')
-                        logger.info("Got code, trying to sign in...")
-
-                        try:
-                            await client.sign_in(phone=phone, code=auth_code, phone_code_hash=phone_code_hash)
-                            logger.info("Login realizado com sucesso!")
-                            break
-                        except errors.SessionPasswordNeededError:
-                            logger.warning("2FA Password needed!")
-                            while True:
-                                redis_client.set('worker:telegram:status', 'waiting_for_password')
-                                password = await wait_for_auth_value('password')
-                                logger.info("Got 2FA password, trying to sign in...")
-                                try:
-                                    await client.sign_in(password=password)
-                                    logger.info("Login 2FA realizado com sucesso!")
-                                    break
-                                except errors.PasswordHashInvalidError:
-                                    logger.warning("Senha 2FA inválida. Aguardando nova senha...")
-                            break
-                        except (errors.PhoneCodeInvalidError, errors.PhoneCodeEmptyError):
-                            logger.warning("Código inválido. Aguardando novo código...")
-                        except errors.PhoneCodeExpiredError:
-                            logger.warning("Código expirado. Solicitando um novo código...")
-                            send_code_result = await client.send_code_request(phone)
-                            phone_code_hash = send_code_result.phone_code_hash
-                finally:
-                    auth_pubsub.close()
-
+            set_worker_status("connected")
             logger.info("Worker is connected to Telegram and monitoring!")
 
-            session_ending = asyncio.Event()
-
-            # Start heartbeat loop in background
-            async def heartbeat():
-                while client.is_connected() and not session_ending.is_set():
-                    try:
-                        status_data = {
-                            "status": "connected",
-                            "version": VERSION,
-                            "last_heartbeat": datetime.now(timezone.utc).isoformat(),
-                            "watchlist_size": len(watchlist),
-                            "monitored_groups_count": len(monitored_groups)
-                        }
-                        await asyncio.to_thread(redis_client.set, 'worker:telegram:status', 'connected', ex=60)
-                        await asyncio.to_thread(redis_client.set, 'worker:telegram:health', json.dumps(status_data), ex=60)
-                    except Exception as e:
-                        logger.error(f"Heartbeat failed: {e}")
-                    await asyncio.sleep(30)
-            
-            asyncio.create_task(heartbeat())
-            session_listener = asyncio.create_task(listen_for_session_commands(client, session_ending))
+            command_task = asyncio.create_task(
+                monitor_session_commands(client, session_ending)
+            )
 
             await client.run_until_disconnected()
 
-            unexpected_disconnect = not session_ending.is_set()
-            session_ending.set()
-            if unexpected_disconnect:
-                session_listener.cancel()
-            with suppress(asyncio.CancelledError):
-                await session_listener
-
-            logger.info("Sessão do Telegram encerrada; reiniciando autenticação...")
-            try:
-                redis_client.delete('worker:telegram:status')
-            except Exception as e:
-                logger.error(f"Falha ao limpar status do worker no Redis: {e}")
+            if not session_ending.is_set():
+                logger.warning("Sessão do Telegram encerrada inesperadamente.")
+            set_worker_status("restarting")
             await asyncio.sleep(2)
-            continue
-        except errors.FloodWaitError as e:
-            wait_seconds = max(int(getattr(e, 'seconds', 0)) + 5, 60)
+        except errors.FloodWaitError as exc:
+            wait_seconds = max(int(getattr(exc, "seconds", 0)) + 5, 60)
             logger.warning(
-                f"Telegram limitou novas tentativas. Aguardando {wait_seconds}s antes de solicitar outro código."
+                "Telegram limitou novas tentativas. "
+                f"Aguardando {wait_seconds}s antes de solicitar outro código."
             )
-            try:
-                redis_client.set('worker:telegram:status', 'restarting', ex=wait_seconds + 60)
-            except Exception:
-                pass
-            if client.is_connected():
-                await client.disconnect()
+            set_worker_status("restarting")
             await asyncio.sleep(wait_seconds)
-            continue
-        except Exception as e:
-            if type(e).__name__ == 'ApiIdInvalidError':
-                logger.error("Invalid API ID/Hash combination. Please check your credentials in the UI.")
+        except Exception as exc:
+            if type(exc).__name__ == "ApiIdInvalidError":
+                logger.error(
+                    "Invalid API ID/Hash combination. "
+                    "Please check your credentials in the UI."
+                )
+                await wait_for_credentials_change(api_id, api_hash)
             else:
-                logger.error(f"Error starting Telegram Client: {e}")
-            
-            if client.is_connected():
-                await client.disconnect()
-                
-            logger.info("Waiting for credentials to be updated in the database...")
-            last_api_id, last_api_hash = api_id, api_hash
-            while True:
+                logger.error(f"Error starting Telegram Client: {exc}")
+                set_worker_status("restarting")
                 await asyncio.sleep(5)
-                creds = get_config_from_api(CREDENTIALS_ENDPOINT)
-                if creds and (creds.get('api_id') != last_api_id or creds.get('api_hash') != last_api_hash):
-                    logger.info("Credentials updated, restarting client...")
-                    break
+        finally:
+            if command_task:
+                command_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await command_task
+            if client.is_connected():
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+
+async def run():
+    global http_client
+
+    if not BACKEND_API_KEY:
+        logger.error("HARPIA_API_KEY is not configured; the worker cannot reach the API.")
+
+    http_client = httpx.AsyncClient(
+        base_url=BACKEND_URL,
+        headers={"X-API-Key": BACKEND_API_KEY},
+        timeout=httpx.Timeout(10.0, connect=5.0),
+    )
+
+    background_tasks: list[asyncio.Task] = []
+    try:
+        await refresh_monitoring_config()
+        background_tasks = [
+            asyncio.create_task(heartbeat_loop()),
+            asyncio.create_task(config_poll_loop()),
+            asyncio.create_task(alert_sender_loop()),
+        ]
+        await telegram_loop()
+    finally:
+        for task in background_tasks:
+            task.cancel()
+        for task in background_tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        await http_client.aclose()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())

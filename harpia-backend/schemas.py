@@ -1,8 +1,16 @@
-from pydantic import BaseModel, Field
-from datetime import datetime
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 TargetType = Literal["email", "domain", "cpf"]
+WorkerStatus = Literal[
+    "starting",
+    "connected",
+    "waiting_for_code",
+    "waiting_for_password",
+    "restarting",
+    "error",
+]
 
 MAX_BULK_ITEMS = 5000
 
@@ -17,8 +25,7 @@ class WatchlistResponse(WatchlistCreate):
     added_at: datetime
     is_active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class WatchlistBulkCreate(BaseModel):
@@ -42,8 +49,7 @@ class MonitoredGroupCreate(BaseModel):
 class MonitoredGroupResponse(MonitoredGroupCreate):
     id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class GroupBulkCreate(BaseModel):
@@ -75,10 +81,68 @@ class CredentialsResponse(BaseModel):
     api_hash: Optional[str] = None
     phone: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TelegramAuthCode(BaseModel):
     code: Optional[str] = Field(default=None, max_length=16)
     password: Optional[str] = Field(default=None, max_length=256)
+
+
+class AlertCreate(BaseModel):
+    target_value: str = Field(min_length=1, max_length=320)
+    target_type: TargetType
+    telegram_group_id: str = Field(min_length=1, max_length=64)
+    telegram_group_name: Optional[str] = Field(default=None, max_length=255)
+    telegram_message_id: str = Field(min_length=1, max_length=64)
+    message_text: str = Field(min_length=1, max_length=65536)
+    timestamp: datetime
+
+
+class AlertResponse(BaseModel):
+    id: str
+    target_value: str
+    target_type: TargetType
+    telegram_group_id: str
+    telegram_group_name: Optional[str] = None
+    telegram_message_id: str
+    message_text: str
+    timestamp: datetime
+    received_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("timestamp", "received_at", when_used="json")
+    def serialize_timestamp(self, value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+
+
+class AlertIngestResult(BaseModel):
+    status: Literal["created", "duplicate"]
+    alert: AlertResponse
+
+
+class WorkerHeartbeat(BaseModel):
+    status: WorkerStatus
+    version: str = Field(min_length=1, max_length=32)
+    instance_id: str = Field(min_length=1, max_length=64)
+    analyzed_messages: int = Field(ge=0)
+    watchlist_size: int = Field(ge=0)
+    monitored_groups_count: int = Field(ge=0)
+
+
+class MonitoringConfigWatchlistItem(BaseModel):
+    value: str
+    target_type: TargetType
+
+
+class MonitoringConfigGroupItem(BaseModel):
+    name: str
+
+
+class MonitoringConfigResponse(BaseModel):
+    watchlist: list[MonitoringConfigWatchlistItem]
+    groups: list[MonitoringConfigGroupItem]
+    generated_at: datetime

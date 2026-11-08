@@ -1,72 +1,83 @@
 # Documento de Arquitetura de Software (HLD)
 **Projeto:** Harpia
-**Versão:** 1.0 (MVP - Onda 1)
-**Padrão Arquitetural:** Event-Driven (Orientada a Eventos) com Edge Filtering
+**Versão:** 2.0 (MVP - arquitetura simplificada)
+**Padrão Arquitetural:** Edge Filtering com comunicação HTTP entre worker e API
 
 ## 1. Visão Geral do Sistema
-O Harpia é uma ferramenta de Threat Intelligence *open-source* focada no monitoramento de ecossistemas cibercriminosos no Telegram. Diferente de plataformas de arquivamento em massa, o Harpia opera como um "Radar", utilizando uma arquitetura de filtragem na borda (*Edge Filtering*) para capturar, alertar e indexar **apenas** mensagens que contenham alvos previamente cadastrados na *Watchlist* do usuário (E-mails, CPFs, Domínios Corporativos).
+O Harpia é uma ferramenta de Threat Intelligence *open-source* focada no monitoramento de ecossistemas cibercriminosos no Telegram. O sistema opera como um "Radar": aplica filtragem na borda (*Edge Filtering*) e persiste **apenas** mensagens que contenham alvos previamente cadastrados na *Watchlist* (e-mails, CPFs, domínios corporativos).
+
+O MVP não depende de Redis nem de OpenSearch. A API é a fonte de verdade das configurações e a única responsável por escrever no SQLite; o worker se comunica com a API por HTTP.
 
 ## 2. Stack Tecnológico Principal
-A seleção das tecnologias prioriza facilidade de auto-hospedagem (*self-hosting*), alta performance de processamento de texto e um ecossistema sólido.
 
 * **Linguagem Core:** Python 3.12
 * **Frontend (Interface Web):** Nuxt.js (Vue.js)
-* **Backend (API Rest):** FastAPI (Python)
+* **Backend (API REST):** FastAPI (Python)
 * **Ingestão de Dados (Worker):** Telethon (Python - Cliente Telegram)
-* **Mensageria e Sincronização:** Redis
-* **Armazenamento de Configurações:** SQLite
-* **Armazenamento de Alertas (Hits):** OpenSearch
+* **Comunicação worker/API:** HTTP com timeouts, retentativas e heartbeat
+* **Armazenamento:** SQLite (configurações, credenciais, alertas e estado do worker)
 * **Infraestrutura:** Docker e Docker Compose
 
 ## 3. Topologia de Componentes
 
-O sistema é dividido em quatro containers principais e isolados, orquestrados via rede interna do Docker:
+O sistema é dividido em três aplicações e um arquivo de banco:
 
-1.  **UI Component (`harpia-web`):** Aplicação frontend em Nuxt.js servindo o painel de Radar (Watchlist + Feed de Alertas).
-2.  **API Server (`harpia-api`):** Servidor FastAPI responsável pelo CRUD da Watchlist no SQLite e pelas queries no OpenSearch para popular o frontend.
-3.  **Worker de Ingestão (`harpia-worker`):** Processo Python em *background* rodando o Telethon. Mantém conexão WebSockets com o Telegram e escuta o Redis para atualizações.
-4.  **Camada de Dados (`opensearch-node` e `redis-cache`):** Instâncias de banco de dados rodando nativamente para persistência e mensageria.
+1. **UI (`harpia-web`):** dashboard Nuxt.js servindo o painel de Radar (Watchlist + Feed de Alertas). O navegador usa apenas o proxy same-origin `/api`.
+2. **API (`harpia-backend`):** FastAPI responsável pelo CRUD, snapshot de configuração do worker, heartbeat, comandos transitórios de autenticação, ingestão de alertas, consultas e SSE. É o único processo que acessa o SQLite.
+3. **Worker (`harpia-worker`):** processo Python com Telethon, que mantém a conexão com o Telegram, atualiza a configuração em memória periodicamente e envia ocorrências e heartbeat para a API.
+4. **Persistência (`harpia-backend/db/harpia.db`):** arquivo SQLite montado como volume, com WAL habilitado.
 
 ## 4. Fluxos de Dados e Execução
 
-A arquitetura resolve dois grandes desafios de forma assíncrona: a captura massiva de dados e a atualização de configurações em tempo real.
-
 ### Fluxo A: Ingestão e Filtragem na Borda (*Edge Filtering*)
-1.  O **Worker** recebe uma nova mensagem de um grupo monitorado do Telegram.
-2.  O **Worker** compara a mensagem crua com os alvos que estão na sua memória RAM (a *Watchlist* atual).
-3.  Se nenhum alvo for encontrado, a mensagem é **descartada** da memória imediatamente.
-4.  Se houver um *Match* (Hit), o Worker enriquece o payload com metadados (Data, Grupo, Alvo Atingido) e envia o documento diretamente para o **OpenSearch**.
+1. O **Worker** recebe uma nova mensagem de um grupo monitorado do Telegram.
+2. O **Worker** compara o texto com a *Watchlist* que mantém em memória.
+3. Se nenhum alvo for encontrado, a mensagem é descartada imediatamente.
+4. Se houver um *Match* (Hit), o Worker envia o payload para `POST /internal/alerts` na API.
+5. A API valida, deduplica e persiste o alerta no SQLite **antes** de publicar o evento no SSE.
+6. O envio é idempotente: a chave única `(telegram_group_id, telegram_message_id)` evita duplicatas quando o Worker repete uma requisição.
 
-### Fluxo B: Atualização da Watchlist em Tempo Real (*Pub/Sub*)
-Para garantir que o Worker comece a monitorar um novo alvo no mesmo segundo em que o usuário o cadastra, sem precisar reiniciar o container:
-1.  O usuário adiciona `ceo@empresa.com.br` no painel (Nuxt.js).
-2.  A UI faz um POST para a **FastAPI**.
-3.  A **FastAPI** salva o registro no **SQLite** para persistência física.
-4.  No mesmo instante, a **FastAPI** atua como *Publisher* e publica uma mensagem no canal `watchlist_updates` do **Redis** (ex: `{"action": "add", "value": "ceo@empresa.com.br"}`).
-5.  O **Worker** (que atua como *Subscriber* nesse canal) recebe a mensagem e insere o novo e-mail na sua lista em memória RAM. A próxima mensagem do Telegram já será testada contra esse novo alvo.
+### Fluxo B: Atualização da Watchlist e dos Grupos
+1. O usuário altera a Watchlist ou os grupos no painel; a UI chama a FastAPI.
+2. A FastAPI persiste a alteração no SQLite.
+3. O Worker consulta `GET /internal/monitoring-config` a cada 30 segundos e recebe um snapshot completo (apenas alvos ativos).
+4. O Worker substitui a configuração em memória somente após uma resposta válida. Se a API estiver indisponível, mantém a última configuração e tenta novamente com backoff.
+5. A alteração passa a valer sem reiniciar o container.
 
 ### Fluxo C: Consumo do Feed de Alertas (Real-Time Push)
-Para garantir que o painel funcione como um verdadeiro "Radar" em tempo real, o *polling* tradicional é substituído por um fluxo reativo:
-1.  Quando o **Worker** encontra um alvo e salva o documento no **OpenSearch**, ele também publica um evento de notificação em um canal do **Redis** (ex: `new_alert`).
-2.  A **FastAPI** mantém uma conexão persistente (via WebSockets ou Server-Sent Events - SSE) com a UI (Nuxt.js) e atua como *Subscriber* desse canal no Redis.
-3.  Assim que a **FastAPI** recebe o sinal do Redis, ela faz o *Push* automático do novo alerta para a interface.
-4.  A UI (Nuxt.js) atualiza o feed instantaneamente sem precisar fazer requisições periódicas. *(Nota: O GET HTTP tradicional no OpenSearch é feito apenas no primeiro carregamento da página para trazer o histórico dos últimos 50 alertas).*
+1. A API mantém clientes SSE em um broker em memória (uma única instância do uvicorn).
+2. Após o commit de um novo alerta, a API publica o payload no broker.
+3. O dashboard recebe o evento em `/feed/stream` e atualiza o feed imediatamente.
+4. O carregamento inicial usa `GET /feed/history`, com paginação e filtros por data, alvo, tipo, grupo e texto.
+5. Heartbeats também publicam o contador acumulado de mensagens analisadas no mesmo SSE.
+
+### Fluxo D: Estado, Estatísticas e Autenticação do Telegram
+1. O Worker envia `POST /internal/worker/heartbeat` a cada 15 segundos com estado, versão, tamanho da configuração e contador local de mensagens analisadas.
+2. A API persiste o último estado em `worker_state`, acumula o contador entre reinícios e considera o Worker offline após 90 segundos sem heartbeat.
+3. Códigos de verificação e senhas 2FA são enviados pela UI para `/telegram/auth-code` e ficam somente em memória, com TTL de 10 minutos.
+4. O Worker consome os comandos por `GET /internal/worker/commands`. O endpoint também transporta a solicitação de nova sessão.
+5. Códigos e senhas temporários nunca são gravados no SQLite nem nos logs.
 
 ## 5. Modelagem de Dados
 
 ### 5.1. SQLite (Esquema Relacional)
-Focado no estado da aplicação e configurações da ferramenta.
-* **Tabela `Watchlist`:** `id` (PK), `type` (enum: cpf, email, domain), `value` (string), `added_at` (timestamp), `is_active` (boolean).
-* **Tabela `Monitored_Groups`:** `id` (PK), `telegram_chat_id` (string), `name` (string).
-* **Tabela `Credentials`:** `id` (PK), `service` (string), `api_key` (hash/ofuscada).
+* **Tabela `watchlist`:** `id` (PK), `target_type` (cpf, email, domain), `value`, `added_at`, `is_active`.
+* **Tabela `monitored_groups`:** `id` (PK), `telegram_chat_id`, `name`.
+* **Tabela `credentials`:** `id` (PK), `service`, `api_id`, `api_hash`, `phone`.
+* **Tabela `alerts`:** `id` (UUID, PK), `target_value`, `target_type`, `telegram_group_id`, `telegram_group_name`, `telegram_message_id`, `message_text`, `timestamp`, `received_at`.
+  * Índices por data, alvo, tipo e grupo.
+  * Restrição única em `(telegram_group_id, telegram_message_id)` para idempotência.
+* **Tabela `worker_state`:** linha única (`id = 1`) com status, versão, instância, último heartbeat, contadores e tamanho da configuração.
 
-### 5.2. OpenSearch (Esquema NoSQL / Índices)
-Focado no armazenamento de longo prazo e busca de texto dos eventos de detecção (Hits).
-* **Índice `hits`:** Armazena os documentos gerados quando um alvo da Watchlist é encontrado em uma mensagem.
-    * **Campos Principais:** `id` (UUID), `target_value` (string - o alvo atingido), `target_type` (string - cpf, email, domain), `telegram_group_id` (string), `telegram_group_name` (string), `message_text` (text - conteúdo bruto da mensagem), `timestamp` (date - data e hora da captura).
+A pesquisa textual usa `LIKE` com filtros indexados nos campos mais seletivos. O SQLite FTS5 pode ser adicionado se o volume de alertas justificar; não é necessário para o MVP.
 
-### 5.3. Redis (Pub/Sub e Mensageria)
-Focado na comunicação assíncrona entre os serviços e orquestração em tempo real.
-* **Canal `watchlist_updates`:** Utilizado pela API para notificar o Worker instantaneamente sobre adições ou remoções de alvos, permitindo atualização da Watchlist em memória (RAM) sem reinício do container.
-* **Canal `new_alert`:** Utilizado pelo Worker para notificar a API (que repassa à UI via WebSocket/SSE) de que um novo Hit foi indexado no OpenSearch, atualizando o Feed de Alertas do usuário em tempo real.
+### 5.2. Retenção
+O Harpia persiste exclusivamente mensagens que deram match na Watchlist. Mensagens sem match não são gravadas. Alertas históricos permanecem no SQLite mesmo se o alvo for removido da Watchlist.
 
+## 6. Segurança e Operação
+* Endpoints de dados e `/internal/*` exigem `X-API-Key`; `/system/health` é público.
+* O proxy Nuxt injeta a API key no servidor e bloqueia `/internal/*`.
+* Credenciais do Telegram ficam em texto plano no SQLite (limitação atual do MVP), mas o hash é mascarado nas respostas públicas.
+* A sessão do Telethon é um segredo e fica em `harpia-worker/session/`.
+* Healthcheck do backend valida o SQLite; o healthcheck do worker consulta `/internal/worker/status` e só passa após a autenticação no Telegram.
+* Backup do SQLite deve considerar WAL ou usar a API de backup do próprio SQLite. Não há migrations (Alembic) implementadas neste MVP.
